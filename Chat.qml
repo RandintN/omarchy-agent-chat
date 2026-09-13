@@ -42,6 +42,11 @@ Item {
   // tool-using turn grows a new bubble instead of appending to the old one.
   property int currentIndex: -1
   property bool stickToBottom: true
+  // Streamed text is buffered and written to the model at most every
+  // flushTimer.interval ms. pi emits one text_delta per ~1.3 characters, so
+  // writing each one straight through means a model write, a re-layout, and a
+  // full markdown re-parse per character.
+  property string pendingText: ""
 
   // Optimistic until the one-line agent file has been read, so the composer
   // does not flicker to "unsupported" for the first frame of every open.
@@ -89,6 +94,8 @@ Item {
     root.currentIndex = -1
     root.stickToBottom = true
     root.unsupportedNotified = false
+    root.pendingText = ""
+    flushTimer.stop()
     messageModel.clear()
     inputField.text = ""
 
@@ -105,6 +112,8 @@ Item {
     root.opened = false
     root.streaming = false
     root.agentReady = false
+    root.pendingText = ""
+    flushTimer.stop()
     root.currentIndex = -1
     root.stickToBottom = true
     if (agentProc.running) agentProc.running = false
@@ -195,15 +204,18 @@ Item {
       root.streaming = true
       break
     case "assistant_reset":
+      root.flushText()
       root.currentIndex = -1
       break
     case "text":
       root.appendText(event.delta)
       break
     case "assistant_end":
+      root.flushText()
       root.onAssistantEnd(event.text)
       break
     case "tool":
+      root.flushText()
       root.addMessage("tool", event.name || "tool", event.detail || "")
       break
     case "status":
@@ -213,15 +225,19 @@ Item {
       root.modelName = event.name || ""
       break
     case "settled":
+      root.flushText()
+      root.finalizeAssistant()
       root.streaming = false
       root.currentIndex = -1
       root.statusText = ""
       break
     case "error":
+      root.flushText()
       root.streaming = false
       root.addMessage("error", event.text || "The agent rejected the command.")
       break
     case "system":
+      root.flushText()
       root.addMessage("system", event.text || "")
       break
     case "dialog":
@@ -236,8 +252,9 @@ Item {
     if (root.currentIndex >= 0) {
       var current = messageModel.get(root.currentIndex)
       if (text && (!current || !current.msgText)) messageModel.setProperty(root.currentIndex, "msgText", text)
+      messageModel.setProperty(root.currentIndex, "msgMarkdown", true)
     } else if (text) {
-      root.addMessage("assistant", text)
+      root.addMessage("assistant", text, "", true)
     }
   }
 
@@ -245,25 +262,49 @@ Item {
 
   ListModel { id: messageModel }
 
-  function addMessage(kind, text, detail) {
-    messageModel.append({ msgKind: kind, msgText: text || "", msgDetail: detail || "" })
+  // Coalesces streamed deltas into one model write per interval.
+  Timer {
+    id: flushTimer
+    interval: 50
+    repeat: false
+    onTriggered: root.flushText()
+  }
+
+  function addMessage(kind, text, detail, markdown) {
+    messageModel.append({
+      msgKind: kind,
+      msgText: text || "",
+      msgDetail: detail || "",
+      msgMarkdown: markdown === true
+    })
     if (kind === "assistant") root.currentIndex = messageModel.count - 1
-    root.scrollToEnd()
   }
 
   function appendText(delta) {
     if (!delta) return
+    root.pendingText += delta
+    if (!flushTimer.running) flushTimer.start()
+  }
+
+  function flushText() {
+    flushTimer.stop()
+    if (!root.pendingText) return
+    var delta = root.pendingText
+    root.pendingText = ""
     if (root.currentIndex < 0 || root.currentIndex >= messageModel.count) {
-      messageModel.append({ msgKind: "assistant", msgText: "", msgDetail: "" })
+      messageModel.append({ msgKind: "assistant", msgText: "", msgDetail: "", msgMarkdown: false })
       root.currentIndex = messageModel.count - 1
     }
     var current = messageModel.get(root.currentIndex).msgText || ""
     messageModel.setProperty(root.currentIndex, "msgText", current + delta)
-    root.scrollToEnd()
   }
 
-  function scrollToEnd() {
-    if (root.stickToBottom) Qt.callLater(function() { chatList.positionViewAtEnd() })
+  // The turn is done: switch the finished bubble to Markdown. While it is
+  // streaming it stays plain text so Qt does not re-parse the document on
+  // every flush.
+  function finalizeAssistant() {
+    if (root.currentIndex >= 0 && root.currentIndex < messageModel.count)
+      messageModel.setProperty(root.currentIndex, "msgMarkdown", true)
   }
 
   // ------------------------------------------------------- agent wiring
@@ -446,6 +487,7 @@ Item {
             required property string msgKind
             required property string msgText
             required property string msgDetail
+            required property bool msgMarkdown
 
             readonly property bool isUser: msgKind === "user"
             readonly property bool isAssistant: msgKind === "assistant"
@@ -492,7 +534,7 @@ Item {
                 readOnly: true
                 selectByMouse: true
                 wrapMode: TextEdit.Wrap
-                textFormat: TextEdit.MarkdownText
+                textFormat: messageRow.msgMarkdown ? TextEdit.MarkdownText : TextEdit.PlainText
                 text: messageRow.msgText.length > 0
                   ? messageRow.msgText
                   : (messageRow.index === root.currentIndex && root.streaming ? "…" : "")
