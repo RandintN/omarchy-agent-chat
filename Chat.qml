@@ -412,6 +412,7 @@ Item {
               id: statusLabelText
               anchors.centerIn: parent
               text: root.statusLabel
+              textFormat: Text.PlainText
               color: root.streaming ? root.accentText : root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -475,6 +476,7 @@ Item {
                   anchors.fill: parent
                   anchors.margins: Style.space(9)
                   text: messageRow.msgText
+                  textFormat: Text.PlainText
                   color: root.accentText
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -501,13 +503,15 @@ Item {
                 selectedTextColor: root.accentText
               }
 
-              // Tool / system / error line.
+              // Tool / system / error line. Rendered as plain text: the agent
+              // controls this string, and AutoText would let it inject markup.
               Text {
                 visible: !messageRow.isUser && !messageRow.isAssistant
                 width: parent.width
                 text: (messageRow.isTool ? "⚙ " : (messageRow.isError ? "✕ " : "• "))
                   + messageRow.msgText
                   + (messageRow.msgDetail ? "   " + messageRow.msgDetail : "")
+                textFormat: Text.PlainText
                 color: messageRow.isError ? root.danger : root.foreground
                 opacity: messageRow.isTool ? 0.6 : 0.8
                 font.family: root.fontFamily

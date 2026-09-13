@@ -107,8 +107,11 @@ is summoned, so its lifetime is exactly one conversation:
 - Every wire format lives in [`ChatAdapters.js`](ChatAdapters.js). `Chat.qml`
   only renders normalized events, so supporting another agent means adding an
   adapter, not touching the UI.
-- The session is in-memory for the modal's lifetime: conversations are not
-  persisted to disk.
+- The conversation lives in the agent process for the modal's lifetime. `pi`
+  and `omp` are spawned with `--no-session`, so their sessions are not written
+  to disk. `agy` keeps its own transcripts under
+  `~/.gemini/antigravity-cli/brain/` (turn text and tool output included), so
+  treat an `agy` conversation as on-disk even after you press Esc.
 
 ### Wire details for the pi dialect
 
@@ -155,6 +158,11 @@ this one spawns a coding agent that can run tools on your machine. Concretely:
 
 Review the code before enabling: `ChatAdapters.js` is the only file that
 decides which commands are spawned.
+
+Conversation history: the modal itself never writes to disk, but the agent may.
+`pi`/`omp` run with `--no-session`; `agy` persists transcripts (including tool
+output) under `~/.gemini/antigravity-cli/brain/`. Do not paste secrets you are
+not comfortable leaving in those files.
 
 ## Configure
 
