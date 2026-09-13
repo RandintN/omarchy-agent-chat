@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "robson.agent-chat",
+  "name": "Agent Chat",
+  "version": "1.0.0",
+  "author": "Robson Cassiano",
+  "license": "MIT",
+  "description": "A fullscreen dialog to chat with your default coding agent (pi, omp, or agy) without leaving the desktop.",
+  "kinds": [
+    "overlay"
+  ],
+  "entryPoints": {
+    "overlay": "Chat.qml"
+  }
+}
