@@ -5,7 +5,7 @@ leaving the desktop. Summon it with **Alt+Space**, type, press Enter, and keep
 the back-and-forth going. **Esc** ends the conversation and kills the agent
 process.
 
-![Agent Chat modal showing a multi-turn conversation with a tool call](preview.png)
+![Agent Chat modal with a streamed reply and the active model in the header](preview.png)
 
 ```
 Alt+Space ──▶ robson.agent-chat ──▶ adapter ──▶ pi | omp | agy
