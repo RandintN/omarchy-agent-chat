@@ -48,6 +48,17 @@ Item {
   // full markdown re-parse per character.
   property string pendingText: ""
 
+  // Memory exhaustion boundaries:
+  readonly property int maxFrameBytes: 65536         // 64 KiB per stdout/stderr frame
+  readonly property int maxMessageBytes: 32768       // 32 KiB per message text
+  readonly property int maxAssistantBytes: 131072    // 128 KiB per assistant reply turn
+  readonly property int maxMessageCount: 100         // at most 100 messages retained in model
+  readonly property int maxTotalModelBytes: 524288   // 512 KiB total text retained across model
+
+  property int totalModelBytes: 0
+  property string stdoutBuf: ""
+  property string stderrBuf: ""
+
   // Optimistic until the one-line agent file has been read, so the composer
   // does not flicker to "unsupported" for the first frame of every open.
   readonly property bool rpcSupported: !root.agentResolved || (!!root.adapter && root.adapter.supported)
@@ -95,7 +106,11 @@ Item {
     root.stickToBottom = true
     root.unsupportedNotified = false
     root.pendingText = ""
+    root.totalModelBytes = 0
+    root.stdoutBuf = ""
+    root.stderrBuf = ""
     flushTimer.stop()
+    killTimer.stop()
     messageModel.clear()
     inputField.text = ""
 
@@ -113,10 +128,13 @@ Item {
     root.streaming = false
     root.agentReady = false
     root.pendingText = ""
+    root.stdoutBuf = ""
+    root.stderrBuf = ""
     flushTimer.stop()
+    killTimer.stop()
     root.currentIndex = -1
     root.stickToBottom = true
-    if (agentProc.running) agentProc.running = false
+    if (agentProc.running) agentProc.signal(15)
   }
 
   function toggle() {
@@ -270,19 +288,38 @@ Item {
     onTriggered: root.flushText()
   }
 
+  function pruneModel(incomingBytes) {
+    var extra = incomingBytes || 0
+    while (messageModel.count > 0 && (messageModel.count >= root.maxMessageCount || (root.totalModelBytes + extra) > root.maxTotalModelBytes)) {
+      var first = messageModel.get(0)
+      var len = ((first && first.msgText) ? first.msgText.length : 0) + ((first && first.msgDetail) ? first.msgDetail.length : 0)
+      root.totalModelBytes = Math.max(0, root.totalModelBytes - len)
+      messageModel.remove(0)
+      if (root.currentIndex > 0) root.currentIndex--
+      else if (root.currentIndex === 0) root.currentIndex = -1
+    }
+  }
+
   function addMessage(kind, text, detail, markdown) {
+    var safeText = String(text || "").slice(0, root.maxMessageBytes)
+    var safeDetail = String(detail || "").slice(0, root.maxMessageBytes)
+    var msgLen = safeText.length + safeDetail.length
+    root.pruneModel(msgLen)
     messageModel.append({
       msgKind: kind,
-      msgText: text || "",
-      msgDetail: detail || "",
+      msgText: safeText,
+      msgDetail: safeDetail,
       msgMarkdown: markdown === true
     })
+    root.totalModelBytes += msgLen
     if (kind === "assistant") root.currentIndex = messageModel.count - 1
   }
 
   function appendText(delta) {
     if (!delta) return
-    root.pendingText += delta
+    if (root.pendingText.length >= root.maxAssistantBytes) return
+    var allowed = root.maxAssistantBytes - root.pendingText.length
+    root.pendingText += delta.slice(0, allowed)
     if (!flushTimer.running) flushTimer.start()
   }
 
@@ -292,11 +329,20 @@ Item {
     var delta = root.pendingText
     root.pendingText = ""
     if (root.currentIndex < 0 || root.currentIndex >= messageModel.count) {
-      messageModel.append({ msgKind: "assistant", msgText: "", msgDetail: "", msgMarkdown: false })
-      root.currentIndex = messageModel.count - 1
+      root.addMessage("assistant", "", "", false)
     }
     var current = messageModel.get(root.currentIndex).msgText || ""
-    messageModel.setProperty(root.currentIndex, "msgText", current + delta)
+    if (current.length >= root.maxAssistantBytes) return
+
+    var toAdd = delta.slice(0, root.maxAssistantBytes - current.length)
+    var updated = current + toAdd
+    if (current.length + delta.length > root.maxAssistantBytes) {
+      updated += "\n\n[Response truncated: maximum message size reached]"
+    }
+    var addedBytes = updated.length - current.length
+    root.pruneModel(addedBytes)
+    root.totalModelBytes += addedBytes
+    messageModel.setProperty(root.currentIndex, "msgText", updated)
   }
 
   // The turn is done: switch the finished bubble to Markdown. While it is
@@ -305,6 +351,33 @@ Item {
   function finalizeAssistant() {
     if (root.currentIndex >= 0 && root.currentIndex < messageModel.count)
       messageModel.setProperty(root.currentIndex, "msgMarkdown", true)
+  }
+
+  function terminateAgent(reason) {
+    if (agentProc.running) {
+      agentProc.signal(15)
+      killTimer.restart()
+    }
+    root.streaming = false
+    root.agentReady = false
+    root.stdoutBuf = ""
+    root.stderrBuf = ""
+    root.pendingText = ""
+    flushTimer.stop()
+    root.addMessage("error", reason || "Agent process terminated due to resource limit violation.")
+  }
+
+  Timer {
+    id: killTimer
+    interval: 2000
+    repeat: false
+    onTriggered: {
+      if (agentProc.running) agentProc.signal(9)
+    }
+  }
+
+  Component.onDestruction: {
+    if (agentProc.running) agentProc.signal(15)
   }
 
   // ------------------------------------------------------- agent wiring
@@ -316,15 +389,46 @@ Item {
     workingDirectory: root.home
 
     stdout: SplitParser {
-      splitMarker: "\n"
-      onRead: function(line) { root.handleEvent(line) }
+      splitMarker: ""
+      onRead: function(chunk) {
+        if (!chunk) return
+        root.stdoutBuf += chunk
+        if (root.stdoutBuf.length > root.maxFrameBytes) {
+          root.terminateAgent("Agent stdout frame exceeded limit (" + root.maxFrameBytes + " bytes).")
+          root.stdoutBuf = ""
+          return
+        }
+        var idx
+        while ((idx = root.stdoutBuf.indexOf("\n")) !== -1) {
+          var line = root.stdoutBuf.slice(0, idx)
+          root.stdoutBuf = root.stdoutBuf.slice(idx + 1)
+          if (line.length > root.maxFrameBytes) {
+            root.terminateAgent("Agent stdout line exceeded limit.")
+            return
+          }
+          root.handleEvent(line)
+        }
+      }
     }
 
     stderr: SplitParser {
-      splitMarker: "\n"
-      onRead: function(line) {
-        var message = String(line || "").trim()
-        if (message) root.addMessage("system", message)
+      splitMarker: ""
+      onRead: function(chunk) {
+        if (!chunk) return
+        root.stderrBuf += chunk
+        if (root.stderrBuf.length > root.maxFrameBytes) {
+          root.terminateAgent("Agent stderr frame exceeded limit (" + root.maxFrameBytes + " bytes).")
+          root.stderrBuf = ""
+          return
+        }
+        var idx
+        while ((idx = root.stderrBuf.indexOf("\n")) !== -1) {
+          var line = root.stderrBuf.slice(0, idx).trim()
+          root.stderrBuf = root.stderrBuf.slice(idx + 1)
+          if (line) {
+            root.addMessage("system", line.slice(0, root.maxMessageBytes))
+          }
+        }
       }
     }
 
@@ -335,6 +439,7 @@ Item {
     }
 
     onExited: function(exitCode, exitStatus) {
+      killTimer.stop()
       root.agentReady = false
       root.streaming = false
       if (root.opened) root.addMessage("error", "The agent exited (code " + exitCode + ").")
@@ -416,6 +521,7 @@ Item {
 
           Text {
             text: "󰚩"
+            textFormat: Text.PlainText
             color: root.accentText
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
@@ -424,6 +530,7 @@ Item {
 
           Text {
             text: "Default agent"
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
@@ -433,6 +540,7 @@ Item {
 
           Text {
             text: root.defaultAgent ? "· " + root.defaultAgent : ""
+            textFormat: Text.PlainText
             color: root.foreground
             opacity: 0.55
             font.family: root.fontFamily
@@ -573,6 +681,7 @@ Item {
             Text {
               width: parent.width
               text: "󰚩"
+              textFormat: Text.PlainText
               color: root.accentText
               opacity: 0.75
               font.family: root.fontFamily
@@ -585,6 +694,7 @@ Item {
               text: root.rpcSupported
                 ? "Ask anything. The conversation lives in the agent until you press Esc."
                 : "Set the default agent to pi to chat here."
+              textFormat: Text.PlainText
               color: root.foreground
               opacity: 0.6
               font.family: root.fontFamily
@@ -612,6 +722,7 @@ Item {
             anchors.rightMargin: Style.space(12)
             enabled: root.rpcSupported
             clip: true
+            maximumLength: 8192
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -640,6 +751,7 @@ Item {
             text: root.rpcSupported
               ? (root.streaming ? "Steer with an instruction…" : "Ask something…")
               : "Agent does not support RPC"
+            textFormat: Text.PlainText
             color: root.foreground
             opacity: 0.42
             elide: Text.ElideRight
@@ -668,6 +780,7 @@ Item {
                 id: enterKey
                 anchors.centerIn: parent
                 text: "Enter"
+                textFormat: Text.PlainText
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -676,6 +789,7 @@ Item {
 
             Text {
               text: root.streaming ? "send as steer" : "send"
+              textFormat: Text.PlainText
               color: root.foreground
               opacity: 0.6
               font.family: root.fontFamily
@@ -698,6 +812,7 @@ Item {
                 id: escKey
                 anchors.centerIn: parent
                 text: "Esc"
+                textFormat: Text.PlainText
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -706,6 +821,7 @@ Item {
 
             Text {
               text: "end"
+              textFormat: Text.PlainText
               color: root.foreground
               opacity: 0.6
               font.family: root.fontFamily
