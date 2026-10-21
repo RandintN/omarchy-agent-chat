@@ -36,6 +36,7 @@ Item {
   property string defaultAgent: ""
   property var adapter: null
   property bool unsupportedNotified: false
+  property bool selfKilled: false
 
   // Index of the assistant bubble currently receiving deltas, or -1 when the
   // next delta should open a fresh bubble. Reset on every message_start so a
@@ -105,6 +106,7 @@ Item {
     root.currentIndex = -1
     root.stickToBottom = true
     root.unsupportedNotified = false
+    root.selfKilled = false
     root.pendingText = ""
     root.totalModelBytes = 0
     root.stdoutBuf = ""
@@ -134,7 +136,10 @@ Item {
     killTimer.stop()
     root.currentIndex = -1
     root.stickToBottom = true
-    if (agentProc.running) agentProc.signal(15)
+    if (agentProc.running) {
+      agentProc.signal(15)
+      killTimer.restart()
+    }
   }
 
   function toggle() {
@@ -206,6 +211,21 @@ Item {
       root.statusText = ""
     }
     root.send(command)
+  }
+
+  // Aborts the in-flight turn. Uses the adapter's abort command when one
+  // exists; otherwise terminates the agent process for this turn.
+  function abortTurn() {
+    if (!root.streaming || !agentProc.running) return
+    var cancel = root.adapter && root.adapter.abort ? root.adapter.abort() : null
+    if (cancel) {
+      root.send(cancel)
+    } else {
+      root.selfKilled = true
+      root.addMessage("system", "Agent has no abort command; terminating its process.")
+      agentProc.signal(15)
+      killTimer.restart()
+    }
   }
 
   // The adapter turns a raw stdout line into normalized events; this file only
@@ -442,7 +462,8 @@ Item {
       killTimer.stop()
       root.agentReady = false
       root.streaming = false
-      if (root.opened) root.addMessage("error", "The agent exited (code " + exitCode + ").")
+      if (root.opened && !root.selfKilled) root.addMessage("error", "The agent exited (code " + exitCode + ").")
+      root.selfKilled = false
     }
   }
 
@@ -464,6 +485,11 @@ Item {
     sequence: "Escape"
     enabled: root.opened
     onActivated: root.dismiss()
+  }
+  Shortcut {
+    sequence: "Ctrl+Enter"
+    enabled: root.opened && root.streaming
+    onActivated: root.abortTurn()
   }
 
   // ------------------------------------------------------------- surface
@@ -733,10 +759,7 @@ Item {
             onTextChanged: root.inputText = text
 
             Keys.onPressed: function(event) {
-              if (event.key === Qt.Key_Escape) {
-                root.dismiss()
-                event.accepted = true
-              } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                 root.sendPrompt()
                 event.accepted = true
               }
@@ -789,6 +812,39 @@ Item {
 
             Text {
               text: root.streaming ? "send as steer" : "send"
+              textFormat: Text.PlainText
+              color: root.foreground
+              opacity: 0.6
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              Layout.alignment: Qt.AlignVCenter
+            }
+          }
+
+          RowLayout {
+            visible: root.streaming
+            spacing: Style.space(6)
+
+            Rectangle {
+              Layout.preferredHeight: Style.space(18)
+              Layout.preferredWidth: abortKey.implicitWidth + Style.space(10)
+              Layout.alignment: Qt.AlignVCenter
+              radius: Style.space(4)
+              color: Util.alpha(root.foreground, 0.1)
+
+              Text {
+                id: abortKey
+                anchors.centerIn: parent
+                text: "Ctrl+Enter"
+                textFormat: Text.PlainText
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Text {
+              text: "abort"
               textFormat: Text.PlainText
               color: root.foreground
               opacity: 0.6

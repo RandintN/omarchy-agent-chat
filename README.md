@@ -43,6 +43,7 @@ immediately.
 
 | Key | Action |
 |---|---|
+| `Ctrl+Enter` | Abort the running reply (`pi`/`omp`); for agents without an abort command, terminate the agent process |
 | `Alt+Space` | Open the modal, or close it if it is already open |
 | `Enter` | Send the message |
 | `Esc` | End the conversation, kill the agent, close the modal |
@@ -98,12 +99,15 @@ are documented at the top of that file.
 The overlay is a `kinds: ["overlay"]` shell plugin. It is loaded only while it
 is summoned, so its lifetime is exactly one conversation:
 
-- The host calls `open()` on summon and `close()` on hide. `close()` sets
-  `Process.running = false`, which terminates the agent with the overlay.
+- The host calls `open()` on summon and `close()` on hide. `close()` sends
+  `SIGTERM` to the agent and escalates to `SIGKILL` after two seconds if it
+  does not exit; the Loader then drops the item, taking the Process with it.
 - The agent is spawned once per conversation and spoken to over a persistent,
   line-delimited JSON protocol: one JSON command per line on stdin, one JSON
   event per line on stdout. There is no terminal emulation inside the modal —
   the events are rendered directly.
+- Assistant replies render as Markdown, so inline images are shown. Tool,
+  system, and error lines stay plain text.
 - Every wire format lives in [`ChatAdapters.js`](ChatAdapters.js). `Chat.qml`
   only renders normalized events, so supporting another agent means adding an
   adapter, not touching the UI.
