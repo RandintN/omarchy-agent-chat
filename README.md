@@ -174,6 +174,38 @@ The plugin is enabled through the `plugins[]` list in
 `~/.config/omarchy/shell.json`, which `omarchy plugin add --enable` updates for
 you. The keybinding is the `bindings.lua` entry shown under [Install](#install).
 
+## Update
+
+```bash
+omarchy plugin update robson.agent-chat
+```
+
+Pulls from the git remote the plugin was cloned from, validates the manifest,
+and rescans the shell. It only accepts a fast-forward, so:
+
+- Do not edit files inside `~/.config/omarchy/plugins/robson.agent-chat/`; a
+  dirty tree blocks the merge.
+- If history is rewritten upstream (force-push, rebase), update fails with
+  `cannot fast-forward ... you have local changes` even with a clean tree.
+  The message covers both causes. Realign the checkout, then retry:
+
+  ```bash
+  git -C ~/.config/omarchy/plugins/robson.agent-chat reset --hard origin/main
+  omarchy plugin update robson.agent-chat
+  ```
+
+  Or reinstall cleanly: `omarchy plugin remove robson.agent-chat --yes`, then
+  `omarchy plugin add https://github.com/RandintN/omarchy-agent-chat.git --enable`.
+- Non-interactive runs need `--yes`; without a terminal, update refuses to
+  confirm otherwise.
+- After updating, confirm the plugin is still enabled and on the expected
+  commit:
+
+  ```bash
+  omarchy plugin list | grep robson.agent-chat
+  git -C ~/.config/omarchy/plugins/robson.agent-chat rev-parse HEAD
+  ```
+
 ## Remove
 
 ```bash
