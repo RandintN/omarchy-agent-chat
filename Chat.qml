@@ -49,8 +49,15 @@ Item {
   // full markdown re-parse per character.
   property string pendingText: ""
 
-  // Memory exhaustion boundaries:
-  readonly property int maxFrameBytes: 65536         // 64 KiB per stdout/stderr frame
+  // Memory exhaustion boundaries. Protocol records have no small upper bound:
+  // pi repeats a whole run's message list in `agent_end` and sends complete
+  // tool output in `message_start`/`message_end`, so one legitimate record is
+  // routinely 100 KiB and grows with the tools the agent used. Records are
+  // therefore parsed up to a generous ceiling and skipped past it — losing one
+  // event is survivable (`agent_settled` settles the run), killing the agent
+  // over it is not.
+  readonly property int maxRecordBytes: 33554432     // 32 MiB per stdout record
+  readonly property int maxFrameBytes: 65536         // 64 KiB per rendered stderr line
   readonly property int maxMessageBytes: 32768       // 32 KiB per message text
   readonly property int maxAssistantBytes: 131072    // 128 KiB per assistant reply turn
   readonly property int maxMessageCount: 100         // at most 100 messages retained in model
@@ -59,6 +66,10 @@ Item {
   property int totalModelBytes: 0
   property string stdoutBuf: ""
   property string stderrBuf: ""
+  // Set while the tail of an oversized stdout record is being discarded, so
+  // the bytes after it are not glued onto the next record.
+  property bool stdoutDropping: false
+  property int oversizedRecords: 0
 
   // Optimistic until the one-line agent file has been read, so the composer
   // does not flicker to "unsupported" for the first frame of every open.
@@ -111,6 +122,8 @@ Item {
     root.totalModelBytes = 0
     root.stdoutBuf = ""
     root.stderrBuf = ""
+    root.stdoutDropping = false
+    root.oversizedRecords = 0
     flushTimer.stop()
     killTimer.stop()
     messageModel.clear()
@@ -132,6 +145,7 @@ Item {
     root.pendingText = ""
     root.stdoutBuf = ""
     root.stderrBuf = ""
+    root.stdoutDropping = false
     flushTimer.stop()
     killTimer.stop()
     root.currentIndex = -1
@@ -373,6 +387,17 @@ Item {
       messageModel.setProperty(root.currentIndex, "msgMarkdown", true)
   }
 
+  // One oversized record is reported once, not once per occurrence: a single
+  // run can contain several of them.
+  function noteOversizedRecord(bytes) {
+    root.oversizedRecords++
+    if (root.oversizedRecords === 1) {
+      root.addMessage("system", "Skipped an agent record larger than " +
+        Math.round(root.maxRecordBytes / 1048576) + " MiB (" +
+        Math.round(bytes / 1024) + " KiB seen); the conversation continues.")
+    }
+  }
+
   function terminateAgent(reason) {
     if (agentProc.running) {
       agentProc.signal(15)
@@ -382,6 +407,7 @@ Item {
     root.agentReady = false
     root.stdoutBuf = ""
     root.stderrBuf = ""
+    root.stdoutDropping = false
     root.pendingText = ""
     flushTimer.stop()
     root.addMessage("error", reason || "Agent process terminated due to resource limit violation.")
@@ -412,21 +438,30 @@ Item {
       splitMarker: ""
       onRead: function(chunk) {
         if (!chunk) return
-        root.stdoutBuf += chunk
-        if (root.stdoutBuf.length > root.maxFrameBytes) {
-          root.terminateAgent("Agent stdout frame exceeded limit (" + root.maxFrameBytes + " bytes).")
-          root.stdoutBuf = ""
-          return
+        // Still inside a record already past the ceiling: swallow its tail up
+        // to the next LF, otherwise the remainder is glued onto an unrelated
+        // record and every event after it fails to parse.
+        if (root.stdoutDropping) {
+          var resume = chunk.indexOf("\n")
+          if (resume === -1) return
+          root.stdoutDropping = false
+          chunk = chunk.slice(resume + 1)
         }
+        root.stdoutBuf += chunk
         var idx
         while ((idx = root.stdoutBuf.indexOf("\n")) !== -1) {
           var line = root.stdoutBuf.slice(0, idx)
           root.stdoutBuf = root.stdoutBuf.slice(idx + 1)
-          if (line.length > root.maxFrameBytes) {
-            root.terminateAgent("Agent stdout line exceeded limit.")
-            return
+          if (line.length > root.maxRecordBytes) {
+            root.noteOversizedRecord(line.length)
+            continue
           }
           root.handleEvent(line)
+        }
+        if (root.stdoutBuf.length > root.maxRecordBytes) {
+          root.noteOversizedRecord(root.stdoutBuf.length)
+          root.stdoutBuf = ""
+          root.stdoutDropping = true
         }
       }
     }
@@ -436,11 +471,6 @@ Item {
       onRead: function(chunk) {
         if (!chunk) return
         root.stderrBuf += chunk
-        if (root.stderrBuf.length > root.maxFrameBytes) {
-          root.terminateAgent("Agent stderr frame exceeded limit (" + root.maxFrameBytes + " bytes).")
-          root.stderrBuf = ""
-          return
-        }
         var idx
         while ((idx = root.stderrBuf.indexOf("\n")) !== -1) {
           var line = root.stderrBuf.slice(0, idx).trim()
@@ -448,6 +478,11 @@ Item {
           if (line) {
             root.addMessage("system", line.slice(0, root.maxMessageBytes))
           }
+        }
+        // Diagnostics are informational: bound the buffer and let a long line
+        // through truncated rather than killing the agent over a stack trace.
+        if (root.stderrBuf.length > root.maxFrameBytes) {
+          root.stderrBuf = root.stderrBuf.slice(-root.maxFrameBytes)
         }
       }
     }
